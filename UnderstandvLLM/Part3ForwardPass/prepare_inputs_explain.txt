@@ -1,0 +1,171 @@
+def _prepare_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+    ) -> tuple[
+        torch.Tensor,
+        SpecDecodeMetadata | None,
+    ]:
+
+
+# ok we calculate all of this in 
+# execute_model
+
+total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+assert total_num_scheduled_tokens > 0
+num_reqs = self.input_batch.num_reqs
+assert num_reqs > 0
+
+# ok I have no idea what this does
+need to look later
+
+# OPTIMIZATION: Start copying the block table first.
+# This way, we can overlap the copy with the following CPU operations.
+self.input_batch.block_table.commit_block_table(num_reqs)
+
+
+# E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+req_indices = np.repeat(self.arange_np[:num_reqs], num_scheduled_tokens)
+```
+
+If we have 3 requests with `[2, 5, 3]` tokens each:
+```
+req 0: 2 tokens  →  [0, 0]
+req 1: 5 tokens  →  [1, 1, 1, 1, 1]
+req 2: 3 tokens  →  [2, 2, 2, 2]
+
+req_indices = [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
+
+# cu_num_tokens: [2, 5, 3] -> [2, 7, 10]
+# arange: [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+cu_num_tokens, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
+
+
+cu_num_tokens — cumulative sum, marks boundaries:
+
+[2, 7, 10]  means req0 ends at 2, req1 ends at 7, req2 ends at 10
+
+
+**`arange`** — position within each request:
+```
+[0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+ ├─┤  ├────────────┤  ├─────┤
+ req0      req1         req2
+
+
+positions_np = self.positions.np[:total_num_scheduled_tokens]
+np.add(
+    self.input_batch.num_computed_tokens_cpu[req_indices],
+    arange,
+    out=positions_np,
+)
+
+
+Position = `num_already_computed + offset_within_this_batch`
+
+Example for req1 that already computed 100 tokens:
+
+num_computed_tokens = 100
+arange for req1 = [0, 1, 2, 3, 4]
+
+positions = [100, 101, 102, 103, 104]
+
+# Get token indices.
+# E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
+# -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
+# where M is the max_model_len.
+token_indices = (
+    positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+)
+token_indices_tensor = torch.from_numpy(token_indices)
+
+# next Gather Input IDs
+torch.index_select(
+    self.input_batch.token_ids_cpu_tensor.flatten(),
+    0,
+    token_indices_tensor,
+    out=self.input_ids.cpu[:total_num_scheduled_tokens],
+)
+
+Use the computed indices to gather the actual token IDs into a flat tensor.
+
+
+token_ids_cpu (flattened): [t0_r0, t1_r0, ..., t0_r1, t1_r1, ...]
+token_indices:             [0, 1, M, M+1, M+2, ...]
+input_ids (result):        [t0_r0, t1_r0, t0_r1, t1_r1, t2_r1, ...]
+
+
+# Next: looks like this is important
+Compute Slot Mapping
+Maps each token position to its KV cache slot. 
+The attention kernel needs to know where to read/write 
+KV cache.
+
+self.input_batch.block_table.compute_slot_mapping(req_indices, positions_np)
+self.input_batch.block_table.commit_slot_mapping(total_num_scheduled_tokens)
+
+# Next: Build Attention Metadata
+# I have no idea what is happening here
+need to investigate
+
+self.query_start_loc.np[0] = 0
+self.query_start_loc.np[1 : num_reqs + 1] = cu_num_tokens
+# Note: pad query_start_loc to be non-decreasing, as kernels
+# like FlashAttention requires that
+self.query_start_loc.np[num_reqs + 1 :].fill(cu_num_tokens[-1])
+self.query_start_loc.copy_to_gpu()
+query_start_loc = self.query_start_loc.gpu[: num_reqs + 1]
+
+self.seq_lens.np[:num_reqs] = (
+    self.input_batch.num_computed_tokens_cpu[:num_reqs] + num_scheduled_tokens
+)
+# Fill unused with 0 for full cuda graph mode.
+self.seq_lens.np[num_reqs:].fill(0)
+self.seq_lens.copy_to_gpu()
+
+num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
+num_tokens_np = np.array(num_tokens, dtype=np.int32)
+
+# Record which requests should not be sampled,
+# so that we could clear the sampled tokens before returning
+self.discard_request_mask.np[:num_reqs] = (
+    self.seq_lens.np[:num_reqs] < num_tokens_np
+)
+self.discard_request_mask.copy_to_gpu(num_reqs)
+
+Next:
+# Copy the tensors to the GPU.
+self._prepare_input_ids(
+    scheduler_output,
+    total_num_scheduled_tokens,
+    cu_num_tokens,
+)
+self.positions.copy_to_gpu(total_num_scheduled_tokens)
+
+Next: What is this ? :))
+
+if not use_spec_decode:
+# NOTE(woosuk): Due to chunked prefills, the batch may contain
+# partial requests. While we should not sample any token
+# from these partial requests, we do so for simplicity.
+# We will ignore the sampled tokens from the partial requests.
+# TODO: Support prompt logprobs.
+logits_indices = query_start_loc[1:] - 1
+num_draft_tokens = None
+spec_decode_metadata = None
+num_sampled_tokens = np.ones(num_reqs, dtype=np.int32)
+
+
+Summary
+Step What it builds
+req_indices ->  which request each token belongs to
+positions_np ->  position IDs for RoPE
+token_indices -> where to find each token in 2D array
+input_ids -> actual token IDs (gathered)
+slot_mapping -> KV cache locations
+query_start_loc -> request boundaries
+seq_lens -> total context lengths
+logits_indices -> where to compute logits
+
+# I need to come back to this function 
+with pen and paper

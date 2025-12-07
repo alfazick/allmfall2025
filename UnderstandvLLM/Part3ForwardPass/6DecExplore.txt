@@ -23,7 +23,7 @@ GPUModelRunner.execute_model(
 # that looks funny
 so looks like is
 self.execute_model_state
-for keep track of worker current status
+for keeping track of worker current status
 
 if self.execute_model_state is not None:
     raise RuntimeError(
@@ -90,9 +90,77 @@ if self.use_async_scheduling:
             scheduler_output = deepcopy(scheduler_output)
 
 
-Next: num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
 num_scheduled_tokens — The scheduler has already decided which requests 
 to batch together. This grabs the total token count 
 (sum of all prefill tokens + one decode token per active sequence) 
 that the model will process in this iteration.
 
+# This is interesting like execute_model
+doesn't know if it execxutes in prefil or decode mode 
+it just knows how many tokens scheduler asked 
+
+# Inteligence lives inside of scheduler 
+
+
+Most important things happens here
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+GPUModelRunner.execute_model??
+
+# this line is a heart of state managment
+# need to look separately
+self._update_states(scheduler_output)
+
+# ok next 
+num_reqs = self.input_batch.num_reqs
+req_ids = self.input_batch.req_ids
+tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+
+
+# decipher
+num_reqs = self.input_batch.num_reqs
+How many requests in the batch. Say `3`.
+req_ids = self.input_batch.req_ids
+
+List of request UUIDs:
+["cmpl-a1b2c3...", "cmpl-d4e5f6...", "cmpl-g7h8i9..."]
+
+tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+scheduler_output.num_scheduled_tokens` is a dict:
+{
+    "cmpl-a1b2c3...": 512,
+    "cmpl-d4e5f6...": 1,
+    "cmpl-g7h8i9...": 64,
+}
+
+The list comprehension looks up each request ID → gets `[512, 1, 64]`
+num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+Convert to numpy: `array([512, 1, 64], dtype=int32)`
+max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+Longest sequence: `512`
+Used for padding decisions and attention mask shapes.
+num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+
+Total tokens: `577` (512 + 1 + 64)
+**Summary:**
+
+`num_reqs` | 3 | batch size (requests) 
+`req_ids` | ["cmpl-a1...", ...] | which requests
+`num_scheduled_tokens_np` | [512, 1, 64] | tokens per request 
+`max_num_scheduled_tokens` | 512 | longest one 
+`num_tokens_unpadded` | 577 | total work 
+
+# ok so next tuple unpacking 
+(logits_indices,spec_decode_metadata,
+) = self._prepare_inputs(
+    scheduler_output,
+    num_scheduled_tokens_np,
+)
+
+# ok looks like we need to look into self._prepare_inputs()
+
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+GPUModelRunner._prepare_inputs??
