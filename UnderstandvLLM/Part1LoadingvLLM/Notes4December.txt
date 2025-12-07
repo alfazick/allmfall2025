@@ -1,0 +1,182 @@
+
+# Idea 1 cloudpickle
+
+class LLM
+
+if "worker_cls" in kwargs:
+    worker_cls = kwargs["worker_cls"]
+    # if the worker_cls is not qualified string name,
+    # we serialize it using cloudpickle to avoid pickling issues
+    if isinstance(worker_cls, type):
+        kwargs["worker_cls"] = cloudpickle.dumps(worker_cls)
+
+
+The problem it solves:
+When you pass a custom worker_cls to vLLM's LLM engine, that class needs to be sent to worker processes 
+(for tensor parallelism, distributed inference, etc.). The issue is:
+
+If you pass a string like "mymodule.MyWorker" — no problem, workers can import it by name
+If you pass an actual class object — it might fail to pickle, especially if defined in __main__ or has closures
+
+from vllm import LLM
+
+# Option 1: String path (worker imports it)
+llm = LLM(model="...", worker_cls="my_module.CustomWorker")
+
+# Option 2: Direct class reference (gets cloudpickle'd)
+class CustomWorker(Worker):
+    def custom_method(self):
+        ...
+
+llm = LLM(model="...", worker_cls=CustomWorker)  # Automatically serialized
+
+# Idea 2 KV transferConfig
+
+disaggregated inference — separating prefill and decode phases across different GPU nodes
+
+The concept:
+In standard LLM inference, one GPU does both:
+
+Prefill — process the entire prompt, build the KV cache
+Decode — generate tokens one by one using that KV cache
+
+With KV Transfer, you can split these:
+
+Prefill nodes — crunch through prompts (compute-heavy)
+Decode nodes — handle token generation (memory-bound)
+The KV cache gets transferred between them
+
+class KVTransferConfig:
+    kv_role: KVRole | None = None
+    """Whether this vLLM instance produces, consumes KV cache, or both. Choices
+    are 'kv_producer', 'kv_consumer', and 'kv_both'."""
+
+    kv_rank: int | None = None
+    """The rank of this vLLM instance in the KV cache transfer. Typical value:
+    0 for prefill instance, 1 for decode instance.
+    Currently only 1P1D is supported."""
+
+# Idea 3 compute_hash() 
+
+— This is for vLLM's CUDA graph caching system.
+vLLM compiles CUDA graphs to speed up inference, but if the computation graph changes, cached graphs become invalid. So every config class has a compute_hash() that returns a unique fingerprint of settings that would change the graph structure.
+
+class KVTransferConfig:
+    def compute_hash(self) -> str:
+        """
+        WARNING: Whenever a new field is added to this config,
+        ensure that it is included in the factors list if
+        it affects the computation graph.
+    
+        Provide a hash that uniquely identifies all the configs
+        that affect the structure of the computation
+        graph from input ids/embeddings to the final hidden states,
+        excluding anything before input ids/embeddings and after
+        the final hidden states.
+        """
+        # no factors to consider.
+        # this config will not affect the computation graph.
+        factors: list[Any] = []
+        hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
+        return hash_str
+
+
+# Idea 4 uuid4()
+
+UUID4 is random (128 bits of randomness).
+Used here to give each vLLM engine instance a unique ID so they can identify each other during KV transfer.
+
+def __post_init__(self) -> None:
+    if self.engine_id is None:
+        self.engine_id = str(uuid.uuid4())
+
+# Idea 5 safe_hash()
+
+from vllm.utils.hashing import safe_hash
+def safe_hash(data: bytes, usedforsecurity: bool = True) -> HASH:
+    """Hash for configs, defaulting to md5 but falling back to sha256
+    in FIPS constrained environments.
+
+    Args:
+        data: bytes
+        usedforsecurity: Whether the hash is used for security purposes
+
+    Returns:
+        Hash object
+    """
+    try:
+        return hashlib.md5(data, usedforsecurity=usedforsecurity)
+    except (UnsupportedDigestmodError, ValueError):
+        return hashlib.sha256(data)
+
+What it does:
+
+Try MD5 first — faster, 128-bit hash, good enough for cache keys
+Fall back to SHA256 — if MD5 is blocked (FIPS environments)
+
+Why the fallback?
+FIPS (Federal Information Processing Standards) is a US government security standard. 
+In FIPS-compliant systems, MD5 is disabled for security use because it has known collision vulnerabilities. 
+The UnsupportedDigestmodError or ValueError gets raised when you try to use a blocked algorithm.
+
+The usedforsecurity flag:
+pythonhashlib.md5(data, usedforsecurity=usedforsecurity)
+When usedforsecurity=False, it tells the system "I'm just using this for checksums/cache keys, not cryptography" — which can bypass FIPS restrictions. 
+
+But vLLM defaults to True here, so it plays it safe and catches the exception instead.
+
+
+# Idea 6 structured_outputs_config:backend
+
+backend: Literal['auto', 'xgrammar', 'guidance', 'outlines', 'lm-format-enforcer'] = 'auto',
+
+Which library handles the constrained decoding:
+
+auto — vLLM picks based on request type
+
+xgrammar — fast, C++ based, good for JSON
+guidance — Microsoft's library, flexible
+outlines — popular, Python-based
+lm-format-enforcer — another option
+
+
+Minor ideas: 
+disable_any_whitespace: bool = False
+Compact is slightly faster (fewer tokens), but some models are trained on pretty-printed JSON.
+
+# disable_any_whitespace=False (default)
+{"name": "John",  "age": 30}  # whitespace allowed
+
+# disable_any_whitespace=True  
+{"name":"John","age":30}  # compact, no whitespace
+
+disable_additional_properties: bool = False
+{"name": "John", "extra_field": "oops"}  # allowed
+isable_additional_properties=True
+{"name": "John"}  # only declared fields allowed
+
+reasoning_parser: str = ""
+What happens:
+
+Model generates everything:
+<think>
+User wants 2+2. That's basic addition. 2+2=4.
+</think>
+4
+
+Parser splits it into:
+# OpenAI-compatible response format
+{
+    "content": "4",
+    "reasoning_content": "User wants 2+2. That's basic addition. 2+2=4."
+}
+
+
+
+# Idea 7 ReasoningParserManager.list_registered()
+
+
+
+
+
+

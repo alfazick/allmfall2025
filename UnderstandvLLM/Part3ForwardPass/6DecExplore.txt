@@ -1,0 +1,98 @@
+I want to trace how execution happens
+
+so looks like everything happens here
+!ls /usr/local/python/3.12.1/lib/python3.12/site-packages/vllm/v1/worker
+
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+GPUModelRunner.execute_model??
+
+Line by Line 
+
+# torch.inference_mode() :)
+
+ok looks like execute_model
+depends on 
+GPUModelRunner.execute_model(
+    self,
+    scheduler_output: 'SchedulerOutput',
+    intermediate_tensors: vllm.sequence.IntermediateTensors | None = None,
+) -> vllm.v1.outputs.ModelRunnerOutput | vllm.sequence.IntermediateTensors | None
+
+# torch.inference_mode() :)
+
+# that looks funny
+so looks like is
+self.execute_model_state
+for keep track of worker current status
+
+if self.execute_model_state is not None:
+    raise RuntimeError(
+        "State error: sample_tokens() must be called "
+        "after execute_model() returns None."
+    )
+
+
+# ok that's interesting so num_spec_tokens is responsible for 
+speculative decoding
+
+# Shape: [batch_size, num_spec_tokens]
+# Example with 2 requests, 5 spec tokens each:
+_draft_token_ids = [
+    [1042, 887, 2311, 459, 1033],  # request 0's guesses
+    [512, 1887, 943, 2841, 118],   # request 1's guesses
+]
+The edge case: num_spec_tokens > 0 means spec decoding is configured, 
+but _draft_token_ids is None means no drafts were produced 
+this iteration (drafter couldn't run — 
+cold start or input too long for draft model's context window).
+The scheduler output needs modification to reflect "no speculation this step" 
+but with async scheduling that output lives in another process, 
+hence the defensive copy.
+
+# ok so proplem later it calls 
+GPUModelRunner._update_states?? # Todo: Come back to this function crucial!
+
+Source:   
+    def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+        """Update the cached states and the persistent batch with the scheduler
+        output.
+
+        The updated states are used by the `_prepare_inputs` function to create
+        the input GPU tensors for the model.
+
+        The SamplingMetadata is updated and copied to the GPU if there is a
+        new/resumed/paused/finished request in the batch.
+        """
+
+# there are no draft tokens with async scheduling,
+# we clear the spec_decoding info in scheduler_output and
+# use normal sampling but rejection_sampling.
+if self.use_async_scheduling:
+    req_state.prev_num_draft_len = num_spec_tokens
+    if num_spec_tokens and self._draft_token_ids is None:
+        scheduler_output.total_num_scheduled_tokens -= num_spec_tokens
+        scheduler_output.num_scheduled_tokens[req_id] -= num_spec_tokens
+        scheduler_output.scheduled_spec_decode_tokens.pop(req_id, None)
+
+
+ # self._draft_token_ids is None when `input_fits_in_drafter=False`
+        # and there is no draft tokens scheduled. so it need to update the
+        # spec_decoding info in scheduler_output with async_scheduling.
+        # use deepcopy to avoid the modification has influence on the
+        # scheduler_output in engine core process.
+        # TODO(Ronald1995): deepcopy is expensive when there is a large
+        # number of requests, optimize it later.
+        if (
+            self.use_async_scheduling
+            and self.num_spec_tokens
+            and self._draft_token_ids is None
+        ):
+            scheduler_output = deepcopy(scheduler_output)
+
+
+Next: num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+num_scheduled_tokens — The scheduler has already decided which requests 
+to batch together. This grabs the total token count 
+(sum of all prefill tokens + one decode token per active sequence) 
+that the model will process in this iteration.
+

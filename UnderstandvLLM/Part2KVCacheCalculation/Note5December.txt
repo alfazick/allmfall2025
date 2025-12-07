@@ -1,0 +1,235 @@
+
+# 5 December
+
+# Idea #1
+
+When loading the vLLM
+it will try to reserve memory for at least single pass
+for KV Cache
+,  so like when I was trying to load a model 
+it did not allow me to do it
+
+so I resolved the issue with
+llm = LLM("deepseek-ai/deepseek-coder-6.7b-instruct",
+          disable_log_stats=True,
+          max_model_len=8192)
+
+
+but now needs to understand the math
+
+Full Math
+num_layers = 32
+num_kv_heads = 32
+hidden_size = 4096
+max_position_embeddings = 16384 # default that's why I changed
+dtype = bf16 (2 bytes)
+block_size = 16 (vLLM default)
+
+head_size = hidden_size / num_attention_heads = 4096 / 32 = 128
+page_size_bytes = 2 * block_size * num_kv_heads * head_size * dtype_bytes
+               = 2 * 16 * 32 * 128 * 2
+               = 262,144 bytes
+               = 256 KB
+
+num_blocks = cdiv(max_model_len, block_size) 
+           = cdiv(16384, 16) 
+           = 1024 blocks
+
+memory_one_layer = num_blocks * page_size_bytes
+                 = 1024 * 262,144
+                 = 268,435,456 bytes
+                 = 256 MB
+
+total = sum across 32 layers
+      = 32 * 256 MB
+      = 8,192 MB
+      = 8 GB
+
+
+
+
+# Idea #2 Upon calling generate no chat templates get applied
+
+but like the generate method is interesting
+
+self._validate_and_add_requests(
+            prompts=prompts,
+            params=sampling_params,
+            use_tqdm=use_tqdm,
+            lora_request=lora_request,
+            priority=priority,
+        )
+
+
+outputs = self._run_engine(use_tqdm=use_tqdm)
+return self.engine_class.validate_outputs(outputs, RequestOutput)
+
+# Idea #3 LLMEngine is an actual powerhorse
+
+# Idea #4 from vllm.config.model import _get_and_verify_max_len
+"""so what I understood it iterates through the config of is 
+about to get loaded model and looks for they key which is 
+associated with model internal max_seq_len which total prompt + generatedoutput"""
+
+# Idea #5 Sliding Window Attention
+
+# So if model has sliding_window = 4096 in its config:
+
+# Default: vLLM uses sliding window attention (parameter is False)
+# User passes --disable-sliding-window: vLLM uses full attention, but caps max_model_len to 4096
+
+# The check only triggers when user explicitly asks to disable it.
+
+# Full attention (position 10):
+# Token 10 can see: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+#                    ↑  all previous tokens
+# Sliding window = 4 (position 10):
+# Token 10 can see: [_, _, _, _, _, _, 6, 7, 8, 9]
+#                                      ↑  only last 4
+# So how does it "remember" earlier tokens?
+# Layer by layer propagation:
+# Layer 1: token 6 saw tokens [2,3,4,5]
+# Layer 2: token 6 now "contains" info about 2,3,4,5
+# Layer 3: token 10 sees token 6, indirectly gets info about 2,3,4,5
+# Information about old tokens is baked into the hidden states of newer tokens. 
+# It's indirect.
+
+# Idea # 6 EngineCoreClient
+# vLLM can run in two modes:
+
+# In-process (InprocClient) - everything in one process, direct function calls
+# Multi-process (SyncMPClient) - EngineCore runs in separate process, communicates via IPC
+
+# The "client" pattern lets them use the same interface for both:
+# if multiprocess_mode:
+#     return SyncMPClient(...)   # talks to EngineCore via IPC
+# else:
+#     return InprocClient(...)   # talks to EngineCore directly
+
+# So "client" doesn't mean there's a remote server. It means "the thing that talks to EngineCore" - whether that's a direct call or over a socket.
+# The "server" is EngineCore itself. InprocClient just wraps it directly without any network/IPC.
+
+# Idea #7 EngineCore
+from vllm.v1.engine.core import EngineCore
+EngineCore??
+is where everything get's setup
+
+# Setup Model.
+self.model_executor = executor_class(vllm_config)
+if executor_fail_callback is not None:
+    self.model_executor.register_failure_callback(executor_fail_callback)
+
+self.available_gpu_memory_for_kv_cache = -1
+
+# Setup KV Caches and update CacheConfig after profiling.
+num_gpu_blocks, num_cpu_blocks, kv_cache_config = self._initialize_kv_caches(
+    vllm_config
+)
+
+vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
+vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
+self.collective_rpc("initialize_cache", args=(num_gpu_blocks, num_cpu_blocks))
+
+self.structured_output_manager = StructuredOutputManager(vllm_config)
+
+# Setup scheduler.
+Scheduler = vllm_config.scheduler_config.get_scheduler_cls()
+
+# Idea #8 KV Cache Calculation
+
+from vllm.v1.kv_cache_interface import AttentionSpec
+AttentionSpec??
+
+# Calculation of bytes per page size
+class AttentionSpec(KVCacheSpec):
+    num_kv_heads: int
+    head_size: int
+    dtype: torch.dtype
+
+    @property
+    def page_size_bytes(self) -> int:
+        return (
+            2
+            * self.block_size
+            * self.num_kv_heads
+            * self.head_size
+            * get_dtype_size(self.dtype)
+        )
+
+# Calculation of max_memory_usage
+# this function was killing my Loading of DeepSeek
+
+from vllm.v1.kv_cache_interface import FullAttentionSpec
+FullAttentionSpec??
+def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
+    max_model_len = vllm_config.model_config.max_model_len
+    dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
+    pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
+    # Note(hc): each dcp rank only need save
+    # (max_model_len//dcp_world_size) tokens locally.
+    if dcp_world_size * pcp_world_size > 1:
+        max_model_len = cdiv(max_model_len, dcp_world_size * pcp_world_size)
+    return cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
+# Idea 9 Full Flow of KV Cache decision
+EngineCore.__init__
+    → _initialize_kv_caches(vllm_config)
+        → available_memory = model_executor.determine_available_memory()
+        → get_kv_cache_configs(vllm_config, kv_cache_specs, available_memory)
+            → check_enough_kv_cache_memory(vllm_config, spec, available_memory)
+                → needed = max_memory_usage_bytes(vllm_config, specs)
+                    → sum of spec.max_memory_usage_bytes(vllm_config) for each layer
+                        → cdiv(max_model_len, block_size) * page_size_bytes
+                            → page_size_bytes = 2 * block_size * num_kv_heads * head_size * dtype_bytes
+                → if needed > available: raise ValueError
+
+1) EngineCore calculates available memory and needed memory
+2) Needed memory is the sum of all layers
+3) each layer of Attention of the model has KVCacheSpec object (each KVCacheSpec get self registered upon model loading)
+
+For attention layers it's FullAttentionSpec which contains:
+@dataclass(frozen=True)
+class AttentionSpec(KVCacheSpec):
+    num_kv_heads: int
+    head_size: int
+    dtype: torch.dtype
+Plus block_size from the parent class.
+kv_cache_specs = self.model_executor.get_kv_cache_specs()
+
+3) Needed memory is calculated by max_memory_usage_bytes
+from vllm.v1.core.kv_cache_utils import max_memory_usage_bytes
+max_memory_usage_bytes??
+sum(spec.max_memory_usage_bytes(vllm_config) for spec in kv_cache_specs)
+
+4) And this is ridiculos, each spec has exactly the same function name
+from vllm.v1.kv_cache_interface import KVCacheSpec
+KVCacheSpec??
+from vllm.v1.kv_cache_interface import FullAttentionSpec
+FullAttentionSpec??
+
+cdiv(max_model_len, self.block_size) * self.page_size_bytes
+
+5) And here comes our another function for self.page_size_bytes
+from vllm.v1.kv_cache_interface import AttentionSpec
+AttentionSpec??
+@property
+def page_size_bytes(self) -> int:
+    return (
+        2 ## funny one for K one for V
+        * self.block_size
+        * self.num_kv_heads
+        * self.head_size
+        * get_dtype_size(self.dtype)
+
+
+Like really ? so nested structure 
+5 levels deep to get to the actual formula.
+
+
+
+
+
+
+
+
+

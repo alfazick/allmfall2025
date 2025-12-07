@@ -1,0 +1,22 @@
+Topics to explore in depth:
+
+1) disaggregated inference — separating prefill and decode phases across different GPU nodes
+vllm KV transfer implementation
+
+2) torch.compile
+vllm CompilationConfig
+
+3) 
+
+structured_outputs_config:backend
+
+backend: Literal['auto', 'xgrammar', 'guidance', 'outlines', 'lm-format-enforcer'] = 'auto',
+
+Which library handles the constrained decoding:
+
+auto — vLLM picks based on request type
+
+xgrammar — fast, C++ based, good for JSON
+guidance — Microsoft's library, flexible
+outlines — popular, Python-based
+lm-format-enforcer — another option
